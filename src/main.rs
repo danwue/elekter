@@ -27,10 +27,18 @@ fn must_be_true(v: &bool) -> Result<(), ValidationError> {
     }
 }
 
-fn validate_window(v: &Device) -> Result<(), ValidationError> {
-    if v.window.is_some() && v.ratio.is_none() {
+fn validate_constraints(v: &Device) -> Result<(), ValidationError> {
+    if v.window.is_some() && (v.ratio_min.is_none() && v.ratio_max.is_none()) {
         Err(ValidationError::new(
-            "Window can only be specified if ratio is specified",
+            "Window can only be specified if either ratio_min or ratio_max is specified",
+        ))
+    } else if v.threshold.is_none() && v.ratio_max.is_some() {
+        Err(ValidationError::new(
+            "Threshold is needed i ratio_max is specified",
+        ))
+    } else if let Some(ratio_min) = v.ratio_min && let Some(ratio_max) = v.ratio_max && ratio_min > ratio_max {
+        Err(ValidationError::new(
+            "ratio_max must be bigger than ratio_min",
         ))
     } else {
         Ok(())
@@ -59,11 +67,13 @@ struct Conf {
 
 #[derive(Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
-#[validate(schema(function = "validate_window"))]
+#[validate(schema(function = "validate_constraints"))]
 struct Device {
     threshold: Option<NotNan<f32>>,
     #[validate(range(min = 0.0, max = 1.0))]
-    ratio: Option<NotNan<f32>>,
+    ratio_min: Option<NotNan<f32>>,
+    #[validate(range(min = 0.0, max = 1.0))]
+    ratio_max: Option<NotNan<f32>>,
     #[serde(default, with = "humantime_serde::option")]
     window: Option<Duration>,
     cmd_on: NonEmpty<String>,
@@ -110,17 +120,17 @@ fn fetch_prices(
     Ok(prices.data.ee)
 }
 
-fn add_tariff(price: &Price, package: &Package) -> Price {
+fn add_grid_rate(price: &Price, package: &Package) -> Price {
     let local_time = price.timestamp.with_timezone(&Tallinn);
     let local_time_hour = local_time.hour();
-    let current_tariff =
+    let current_grid =
         if (7..22).contains(&local_time_hour) && local_time.weekday().number_from_monday() < 6 {
             package.day
         } else {
             package.night
         };
     Price {
-        price: price.price + current_tariff,
+        price: price.price + current_grid,
         ..*price
     }
 }
@@ -134,8 +144,27 @@ fn satisfy_constraints(prices: &NonEmpty<Price>, device: &Device) -> BTreeSet<Da
             .for_each(|p| {
                 enabled.insert(p.timestamp);
             });
+        if let Some(ratio_max) = device.ratio_max {
+            let interval = (prices.last().timestamp.timestamp()
+                - prices.first().timestamp.timestamp()) as usize
+                / (prices.len() - 1);
+            let window_size = device
+                .window
+                .map(|dur| dur.as_secs() as usize / interval)
+                .unwrap_or(prices.len());
+            let max_enable_per_window = (ratio_max * window_size as f32).floor() as usize;
+            for window in prices.iter().collect_vec().windows(window_size) {
+                window
+                    .iter()
+                    .sorted_by_key(|p| p.price)
+                    .skip(max_enable_per_window)
+                    .for_each(|p| {
+                        enabled.remove(&p.timestamp);
+                    });
+            }
+        }
     }
-    if let Some(ratio) = device.ratio {
+    if let Some(ratio_min) = device.ratio_min {
         let interval = (prices.last().timestamp.timestamp() - prices.first().timestamp.timestamp())
             as usize
             / (prices.len() - 1);
@@ -143,7 +172,7 @@ fn satisfy_constraints(prices: &NonEmpty<Price>, device: &Device) -> BTreeSet<Da
             .window
             .map(|dur| dur.as_secs() as usize / interval)
             .unwrap_or(prices.len());
-        let enable_per_window = (ratio * window_size as f32).ceil() as usize;
+        let enable_per_window = (ratio_min * window_size as f32).ceil() as usize;
         for window in prices.iter().collect_vec().windows(window_size) {
             window
                 .iter()
@@ -182,7 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
 
         // adjust market prices with day/night rates based on selected network package
-        let consumer_prices = market_prices.map(|p| add_tariff(&p, &conf.package));
+        let consumer_prices = market_prices.map(|p| add_grid_rate(&p, &conf.package));
 
         // calculate enabled times for devices based on constraints
         let thresholds: BTreeMap<&String, (&Device, BTreeSet<DateTime<Utc>>)> = conf
