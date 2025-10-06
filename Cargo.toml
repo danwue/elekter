@@ -1,6 +1,6 @@
 [package]
 name = "elekter"
-description = "Foobar"
+description = "Tool for automatically taking actions based on electricity prices in Estonia"
 authors = [ "Daniel Würsch" ]
 version = "0.0.1"
 edition = "2024"
@@ -8,6 +8,7 @@ edition = "2024"
 [dependencies]
 chrono = { version = "0.4.42", features = [ "serde" ] }
 chrono-tz = "0.10.4"
+colored = "3.0.0"
 humantime-serde = "1.1.1"
 itertools = "0.14.0"
 nonempty = { version = "0.12.0", features = ["serialize"] }

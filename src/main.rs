@@ -1,23 +1,24 @@
-use chrono_tz::Tz;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    process::Command,
+    thread,
+    time::{Duration, SystemTime},
+};
+
+use chrono::{DateTime, Datelike, Days, NaiveTime, Timelike, Utc};
+use chrono_tz::{Europe::Tallinn, Tz};
+use colored::Colorize;
 use itertools::Itertools;
+use nonempty::NonEmpty;
+use ordered_float::NotNan;
 use reqwest::blocking::Client;
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use std::process::Command;
-use std::thread;
-use std::time::{Duration, SystemTime};
+use serde::Deserialize;
 use structopt::{
     StructOpt,
     clap::{crate_authors, crate_description, crate_name},
 };
-
 use validator::{Validate, ValidationError};
-
-use chrono::{DateTime, Datelike, Days, NaiveTime, Timelike, Utc};
-use chrono_tz::Europe::Tallinn;
-use nonempty::NonEmpty;
-use ordered_float::NotNan;
-use serde::Deserialize;
 
 fn must_be_true(v: &bool) -> Result<(), ValidationError> {
     if *v {
@@ -36,7 +37,10 @@ fn validate_constraints(v: &Device) -> Result<(), ValidationError> {
         Err(ValidationError::new(
             "Threshold is needed i ratio_max is specified",
         ))
-    } else if let Some(ratio_min) = v.ratio_min && let Some(ratio_max) = v.ratio_max && ratio_min > ratio_max {
+    } else if let Some(ratio_min) = v.ratio_min
+        && let Some(ratio_max) = v.ratio_max
+        && ratio_min > ratio_max
+    {
         Err(ValidationError::new(
             "ratio_max must be bigger than ratio_min",
         ))
@@ -214,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let consumer_prices = market_prices.map(|p| add_grid_rate(&p, &conf.package));
 
         // calculate enabled times for devices based on constraints
-        let thresholds: BTreeMap<&String, (&Device, BTreeSet<DateTime<Utc>>)> = conf
+        let constraints_satisfied: BTreeMap<&String, (&Device, BTreeSet<DateTime<Utc>>)> = conf
             .devices
             .iter()
             .map(|(name, constraints)| {
@@ -237,33 +241,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue; // time in the past, no need to process
                 }
             }
-            println!(
-                "{} ({:6.2} EUR/MWh)",
+            print!(
+                "{} ({:7.2} EUR/MWh):",
                 price.timestamp.with_timezone(&Tallinn).naive_local(),
                 price.price
             );
-            for (dev_name, (dev_conf, en_times)) in &thresholds {
-                let status = en_times.contains(&price.timestamp);
-                println!(
-                    "  {dev_name}: {}",
-                    if status { "enabled" } else { "disabled" }
-                );
-                if !opt.dry_run {
-                    let (cmd, args) = if status {
-                        dev_conf.cmd_on.split_first()
-                    } else {
-                        dev_conf.cmd_off.split_first()
-                    };
-                    let output = Command::new(cmd).args(args).output()?;
-                    if let Some(exit_code) = output.status.code() {
-                        println!("    {cmd} {} (exit {exit_code})", args.join(" "));
-                    }
+            let mut cmds = Vec::with_capacity(constraints_satisfied.len());
+            for (dev_name, (dev_conf, enable_times)) in &constraints_satisfied {
+                if enable_times.contains(&price.timestamp) {
+                    print!(" {}", dev_name.green());
+                    cmds.push(&dev_conf.cmd_on);
+                } else {
+                    print!(" {}", dev_name.red());
+                    cmds.push(&dev_conf.cmd_off);
+                }
+            }
+            println!();
+
+            if opt.dry_run {
+                continue; // skip executing commands when simulating
+            }
+
+            for cmd in cmds {
+                let (cmd, args) = cmd.split_first();
+                let out = Command::new(cmd).args(args).output()?;
+                if let Some(exit_code) = out.status.code()
+                    && exit_code != 0
+                {
+                    eprintln!("{cmd} {} (exited with {exit_code})", args.join(" "));
                 }
             }
         }
 
         if opt.dry_run {
-            break;
+            break; // stop after one day when simulating
         }
     }
     Ok(())
